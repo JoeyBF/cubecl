@@ -1,9 +1,11 @@
-use super::{ManagedMemoryBinding, ManagedMemoryDescriptor, ManagedMemoryHandle};
+use super::{ManagedMemoryBinding, ManagedMemoryDescriptor, ManagedMemoryHandle, PageKey};
 use crate::{
     memory_management::MemoryUsage,
     server::IoError,
     storage::{ComputeStorage, StorageHandle},
 };
+use cubecl_common::backtrace::BackTrace;
+use slotmap::Key;
 
 /// Declares how memory is allocated in a reusable pool.
 pub trait MemoryPool {
@@ -103,6 +105,30 @@ impl Slice {
     /// The description of the slice.
     pub(crate) fn descriptor(&self) -> &ManagedMemoryDescriptor {
         self.handle.descriptor()
+    }
+}
+
+/// The error for a [`PageKey`] that doesn't name a live page — either the page
+/// was deallocated, or the slot has since been reused by a different page and
+/// the key's generation no longer matches.
+///
+/// The two cases are deliberately indistinguishable to the caller: both mean
+/// "this binding outlived its allocation", and neither may resolve to whatever
+/// occupies the slot now.
+pub(crate) fn page_not_found(key: PageKey) -> IoError {
+    // `as_ffi` packs the generation above the slot index; splitting it back out
+    // keeps the message readable (and the generation is the useful half when
+    // diagnosing a binding that outlived its page).
+    let packed = key.data().as_ffi();
+
+    IoError::NotFound {
+        backtrace: BackTrace::capture(),
+        reason: alloc::format!(
+            "Memory page {} (generation {}) doesn't exist",
+            packed as u32,
+            (packed >> 32) as u32
+        )
+        .into(),
     }
 }
 

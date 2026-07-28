@@ -64,6 +64,7 @@ variadics_please = "1"
 dashmap = "6.1.0"
 foldhash = { version = "0.2", default-features = false }
 hashbrown = "0.16"
+slotmap = { version = "1.0.7", default-features = false }
 smallvec = { version = "1", features = [
     "union",
     "const_generics",

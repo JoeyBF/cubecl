@@ -6,8 +6,12 @@ use crate::{
 
 use alloc::vec::Vec;
 use cubecl_common::backtrace::BackTrace;
+use slotmap::SlotMap;
 
-use super::{ManagedMemoryBinding, ManagedMemoryHandle, MemoryPool, Slice, calculate_padding};
+use super::{
+    ManagedMemoryBinding, ManagedMemoryHandle, MemoryPool, PageKey, Slice, calculate_padding,
+    page_not_found,
+};
 
 /// A memory pool that allocates buffers in a range of sizes and reuses them to minimize allocations.
 ///
@@ -15,8 +19,10 @@ use super::{ManagedMemoryBinding, ManagedMemoryHandle, MemoryPool, Slice, calcul
 ///   either read only or `read_write` slices but not a mix of both.
 /// - The pool uses a ring buffer to efficiently manage and reuse pages.
 pub struct ExclusiveMemoryPool {
-    pages: Vec<MemoryPage>,
-    pages_tmp: Vec<MemoryPage>,
+    /// Pages are keyed rather than positional: a page keeps its [`PageKey`] for
+    /// its whole life, so freeing one never invalidates the keys cached in the
+    /// descriptors pointing at the others. See [`PageKey`].
+    pages: SlotMap<PageKey, MemoryPage>,
     alignment: u64,
     dealloc_period: u64,
     last_dealloc_check: u64,
@@ -32,7 +38,7 @@ impl core::fmt::Display for ExclusiveMemoryPool {
             BytesFormat::new(self.max_alloc_size)
         ))?;
 
-        for page in self.pages.iter() {
+        for page in self.pages.values() {
             let is_free = page.slice.is_free();
             let size = BytesFormat::new(page.slice.effective_size());
 
@@ -69,14 +75,13 @@ impl ExclusiveMemoryPool {
         assert_eq!(max_alloc_size % alignment, 0);
 
         Self {
-            pages: Vec::new(),
-            pages_tmp: Vec::new(),
+            pages: SlotMap::with_key(),
             alignment,
             dealloc_period,
             last_dealloc_check: 0,
             max_alloc_size,
             cur_avg_size: max_alloc_size as f64 / 2.0,
-            location_base: MemoryLocation::new(pool_pos, 0, 0),
+            location_base: MemoryLocation::base(pool_pos),
         }
     }
 
@@ -85,7 +90,7 @@ impl ExclusiveMemoryPool {
     fn get_free_page(&mut self, size: u64) -> Option<&mut MemoryPage> {
         // Return the smallest free page that fits.
         self.pages
-            .iter_mut()
+            .values_mut()
             .filter(|page| page.alloc_size >= size && page.slice.is_free())
             .min_by_key(|page| page.free_count)
     }
@@ -94,7 +99,7 @@ impl ExclusiveMemoryPool {
         &mut self,
         storage: &mut Storage,
         size: u64,
-    ) -> Result<(usize, &mut MemoryPage), IoError> {
+    ) -> Result<PageKey, IoError> {
         let alloc_size = (self.cur_avg_size as u64)
             .max(size)
             .next_multiple_of(self.alignment);
@@ -109,16 +114,13 @@ impl ExclusiveMemoryPool {
         slice.storage.utilization = StorageUtilization { offset: 0, size };
         slice.padding = padding;
 
-        self.pages.push(MemoryPage {
+        Ok(self.pages.insert(MemoryPage {
             slice,
             alloc_size,
             // Start the allocation at 'almost ready to free'. Every use will decrement this.
             // This means allocations start as "suspected as unused" and over time will be kept for longer.
             free_count: ALLOC_AFTER_FREE - 1,
-        });
-
-        let idx = self.pages.len() - 1;
-        Ok((idx, &mut self.pages[idx]))
+        }))
     }
 }
 
@@ -163,10 +165,10 @@ impl MemoryPool for ExclusiveMemoryPool {
             });
         }
 
-        let (idx, page) = self.alloc_page(storage, size)?;
-        let handle = page.slice.handle.clone();
+        let key = self.alloc_page(storage, size)?;
+        let handle = self.pages[key].slice.handle.clone();
         let mut location = self.location_base;
-        location.page = idx as u16;
+        location.page = key;
         handle.descriptor().update_location(location);
 
         Ok(handle)
@@ -175,7 +177,7 @@ impl MemoryPool for ExclusiveMemoryPool {
     fn get_memory_usage(&self) -> MemoryUsage {
         let used_slices: Vec<_> = self
             .pages
-            .iter()
+            .values()
             .filter(|page| !page.slice.is_free())
             .collect();
 
@@ -186,7 +188,7 @@ impl MemoryPool for ExclusiveMemoryPool {
                 .map(|page| page.slice.storage.size())
                 .sum(),
             bytes_padding: used_slices.iter().map(|page| page.slice.padding).sum(),
-            bytes_reserved: self.pages.iter().map(|page| page.alloc_size).sum(),
+            bytes_reserved: self.pages.values().map(|page| page.alloc_size).sum(),
         }
     }
 
@@ -202,27 +204,26 @@ impl MemoryPool for ExclusiveMemoryPool {
         if explicit || alloc_nr - self.last_dealloc_check >= check_period {
             self.last_dealloc_check = alloc_nr;
 
-            for mut page in self.pages.drain(..) {
-                if page.slice.is_free() {
-                    page.free_count += 1;
-
-                    // If free found is sufficiently high (ie. we've seen this alloc as free multiple times,
-                    // without it being used in the meantime), deallocate it.
-                    if page.free_count >= ALLOC_AFTER_FREE || explicit {
-                        storage.dealloc(page.slice.storage.id);
-                        continue;
-                    }
+            // Surviving pages keep their key, so a page that was live before the
+            // cleanup is still reachable through every descriptor that named it —
+            // there is nothing to renumber, and no way for a descriptor to end up
+            // naming a page it never pointed at.
+            self.pages.retain(|_, page| {
+                if !page.slice.is_free() {
+                    return true;
                 }
 
-                let page_index = self.pages_tmp.len();
-                page.slice
-                    .handle
-                    .descriptor()
-                    .update_page(page_index as u16);
-                self.pages_tmp.push(page);
-            }
+                page.free_count += 1;
 
-            core::mem::swap(&mut self.pages, &mut self.pages_tmp);
+                // If free found is sufficiently high (ie. we've seen this alloc as free multiple times,
+                // without it being used in the meantime), deallocate it.
+                if page.free_count >= ALLOC_AFTER_FREE || explicit {
+                    storage.dealloc(page.slice.storage.id);
+                    return false;
+                }
+
+                true
+            });
         }
     }
 
@@ -233,7 +234,8 @@ impl MemoryPool for ExclusiveMemoryPool {
         cursor: u64,
     ) -> Result<(), IoError> {
         let id_old = old.descriptor();
-        let page = &mut self.pages[id_old.page()];
+        let key = id_old.page();
+        let page = self.pages.get_mut(key).ok_or_else(|| page_not_found(key))?;
         new.descriptor().update_location(id_old.location());
 
         page.slice.handle = new;
@@ -243,17 +245,94 @@ impl MemoryPool for ExclusiveMemoryPool {
     }
 
     fn find(&self, binding: &ManagedMemoryBinding) -> Result<&Slice, IoError> {
-        let binding_descriptor = binding.descriptor();
-        let page_index = binding_descriptor.page();
-
-        let page = self
-            .pages
-            .get(page_index)
-            .ok_or_else(|| IoError::NotFound {
-                backtrace: BackTrace::capture(),
-                reason: alloc::format!("Memory page {} doesn't exist", page_index).into(),
-            })?;
+        let key = binding.descriptor().page();
+        let page = self.pages.get(key).ok_or_else(|| page_not_found(key))?;
 
         Ok(&page.slice)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::BytesStorage;
+
+    /// Hands `pool`'s freshly allocated page a new identity and drops it, so the
+    /// page reads as free while the returned handle and binding keep naming it.
+    ///
+    /// This is the shape the bug needs: a descriptor the pool can no longer
+    /// reach (in production, a handle orphaned by a `bind` and kept alive by
+    /// another stream's binding) that still carries the page's address.
+    fn orphan(
+        pool: &mut ExclusiveMemoryPool,
+        storage: &mut BytesStorage,
+        size: u64,
+    ) -> (ManagedMemoryHandle, ManagedMemoryBinding) {
+        let reserved = pool.alloc(storage, size).unwrap();
+        let orphan = reserved.clone();
+        let assigned = ManagedMemoryHandle::new();
+
+        pool.bind(reserved, assigned.clone(), 0).unwrap();
+        drop(assigned);
+
+        let binding = orphan.clone().binding();
+        (orphan, binding)
+    }
+
+    #[test_log::test]
+    fn stale_binding_does_not_alias_a_recycled_page() {
+        let mut storage = BytesStorage::default();
+        let mut pool = ExclusiveMemoryPool::new(1024, 32, u64::MAX, 0);
+
+        let (_orphan, stale) = orphan(&mut pool, &mut storage, 1024);
+        pool.cleanup(&mut storage, 0, true);
+        assert!(pool.find(&stale).is_err(), "the page was deallocated");
+
+        // A later allocation takes the vacated slot. The stale binding named the
+        // slot's *previous* occupant, so it must not follow the slot to its new
+        // one — the pool has to catch this itself, rather than leaning on the
+        // identity check `MemoryManagement::find` applies afterwards.
+        let _next = pool.alloc(&mut storage, 1024).unwrap();
+        assert!(matches!(pool.find(&stale), Err(IoError::NotFound { .. })));
+    }
+
+    #[test_log::test]
+    fn surviving_pages_keep_their_key_across_cleanup() {
+        let mut storage = BytesStorage::default();
+        let mut pool = ExclusiveMemoryPool::new(1024, 32, u64::MAX, 0);
+
+        let first = pool.alloc(&mut storage, 1024).unwrap();
+        let kept = pool.alloc(&mut storage, 1024).unwrap();
+        let last = pool.alloc(&mut storage, 1024).unwrap();
+
+        let binding = kept.clone().binding();
+        let location = kept.descriptor().location();
+        drop(first);
+        drop(last);
+
+        // Freeing the pages on either side must leave the survivor exactly where
+        // it was: no renumbering, so every descriptor naming it stays valid —
+        // including any the pool can't reach to update.
+        pool.cleanup(&mut storage, 0, true);
+
+        assert_eq!(pool.find(&binding).unwrap().storage.size(), 1024);
+        assert_eq!(kept.descriptor().location().page, location.page);
+        assert_eq!(pool.get_memory_usage().bytes_reserved, 1024);
+    }
+
+    #[test_log::test]
+    fn binding_a_stale_handle_errors_instead_of_panicking() {
+        let mut storage = BytesStorage::default();
+        let mut pool = ExclusiveMemoryPool::new(1024, 32, u64::MAX, 0);
+
+        let (stale, _) = orphan(&mut pool, &mut storage, 1024);
+        pool.cleanup(&mut storage, 0, true);
+
+        // `bind` used to index the page vector directly, so a handle naming a
+        // page the pool no longer has took the device thread down with it.
+        assert!(matches!(
+            pool.bind(stale, ManagedMemoryHandle::new(), 0),
+            Err(IoError::NotFound { .. })
+        ));
     }
 }
