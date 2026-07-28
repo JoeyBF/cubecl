@@ -78,13 +78,30 @@ impl PartialEq for ManagedMemoryDescriptor {
 
 impl Eq for ManagedMemoryDescriptor {}
 
+slotmap::new_key_type! {
+    /// Identifies a page in a memory pool: the slot the page occupies, plus the
+    /// generation that says *which* occupant of that slot it is.
+    ///
+    /// Pools keep their pages in a [`SlotMap`](slotmap::SlotMap) rather than a
+    /// `Vec`, so a page keeps its key for as long as it lives — freeing another
+    /// page never renumbers it. That matters because this key is cached in the
+    /// descriptor of every handle pointing into the page, including descriptors
+    /// the pool can no longer reach (one orphaned by a `bind`, kept alive by
+    /// another stream's binding). Renumbering can only fix the descriptors the
+    /// pool still reaches; the rest would be left naming whatever moved into
+    /// their old position. The generation closes the remaining gap: once a page
+    /// is freed, a key pointing at it fails to resolve rather than aliasing the
+    /// next page to land in the slot.
+    pub(crate) struct PageKey;
+}
+
 #[derive(Clone, Copy, Debug)]
 /// Defines where the [`ManagedMemoryId`] is located.
 pub(crate) struct MemoryLocation {
     /// The memory pool index in the global memory management.
     pub pool: u8,
-    /// The memory page index in a memory pool.
-    pub page: u16,
+    /// The memory page in a memory pool.
+    pub page: PageKey,
     /// The memory slice index in a memory page.
     pub slice: u32,
     /// Whether the memory location is known/initialized.
@@ -105,14 +122,6 @@ impl ManagedMemoryDescriptor {
         });
     }
 
-    /// Update only the memory page position for the given [`ManagedMemoryId`].
-    pub fn update_page(&self, page: u16) {
-        self.location.update(|mut loc| {
-            loc.page = page;
-            loc
-        });
-    }
-
     /// Retrieves the current location.
     pub(crate) fn location(&self) -> MemoryLocation {
         self.location.get()
@@ -122,18 +131,19 @@ impl ManagedMemoryDescriptor {
         self.location.get().slice as usize
     }
 
-    pub(crate) fn page(&self) -> usize {
-        self.location.get().page as usize
+    pub(crate) fn page(&self) -> PageKey {
+        self.location.get().page
     }
 }
 
 impl MemoryLocation {
-    /// Creates a new memory location.
-    pub(crate) fn new(pool: u8, page: u16, slice: u32) -> Self {
+    /// Creates the base location every slice of `pool` is stamped from: the
+    /// pool position, with the page and slice filled in as they're handed out.
+    pub(crate) fn base(pool: u8) -> Self {
         Self {
             pool,
-            page,
-            slice,
+            page: PageKey::default(),
+            slice: 0,
             init: 1,
         }
     }
@@ -142,7 +152,8 @@ impl MemoryLocation {
     pub(crate) fn uninit() -> Self {
         Self {
             pool: 0,
-            page: 0,
+            // The null key, which no live page ever equals.
+            page: PageKey::default(),
             slice: 0,
             init: 0,
         }
@@ -285,11 +296,11 @@ mod tests {
         let handle = ManagedMemoryHandle::new();
         let handle2 = handle.clone();
 
-        let location = MemoryLocation::new(1, 2, 3);
+        let mut location = MemoryLocation::base(1);
+        location.slice = 3;
         handle.descriptor().update_location(location);
 
         assert_eq!(handle2.descriptor().location().pool, 1);
-        assert_eq!(handle2.descriptor().location().page, 2);
         assert_eq!(handle2.descriptor().location().slice, 3);
         assert_eq!(handle2.descriptor().location().init, 1);
 

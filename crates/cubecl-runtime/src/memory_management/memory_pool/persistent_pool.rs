@@ -53,7 +53,7 @@ impl PersistentPool {
             sizes: HashMap::new(),
             max_alloc_size,
             alignment,
-            location_base: MemoryLocation::new(pool_pos, 0, 0),
+            location_base: MemoryLocation::base(pool_pos),
         }
     }
 

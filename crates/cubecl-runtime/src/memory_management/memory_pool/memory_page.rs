@@ -167,14 +167,6 @@ impl MemoryPage {
             })
     }
 
-    pub fn update_page(&mut self, page: u16) {
-        self.location_base.page = page;
-
-        for slice in self.slices.iter() {
-            slice.descriptor().update_page(page);
-        }
-    }
-
     /// Recompute the memory page metadata to make sure adjacent slices are merged together into a
     /// single slice.
     ///
@@ -712,6 +704,6 @@ mod tests {
     fn new_memory_page(size: u64) -> MemoryPage {
         let storage = StorageHandle::new(StorageId::new(), StorageUtilization { offset: 0, size });
 
-        MemoryPage::new(storage, 4, MemoryLocation::new(0, 0, 0))
+        MemoryPage::new(storage, 4, MemoryLocation::base(0))
     }
 }
