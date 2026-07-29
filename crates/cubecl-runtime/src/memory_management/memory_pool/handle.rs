@@ -1,6 +1,5 @@
 use crate::memory_management::MemoryHandle;
 use alloc::{sync::Arc, vec::Vec};
-use core::cell::Cell;
 
 /// Managed Memory handle
 #[derive(Debug)]
@@ -34,26 +33,30 @@ impl Clone for ManagedMemoryHandle {
 
 /// Managed memory descriptor.
 ///
-/// The location is wrapped in `Cell` for interior mutability: multiple
+/// The location is behind a `spin::Mutex` for interior mutability: multiple
 /// handles share the same descriptor via `Arc`, yet the memory management
 /// system needs to update the location after creation (e.g. during
-/// `reserve` / `bind`). All mutation happens on a single device thread,
-/// so `Cell` is safe — we just need `unsafe impl Sync` because `Cell`
-/// is `!Sync`.
+/// `reserve` / `bind`).
 ///
-/// An alternative would be `spin::Mutex<MemoryLocation>` which avoids the
-/// `unsafe impl Sync` at the cost of a lock on every access.
+/// This used to be a `Cell` plus an `unsafe impl Sync`, on the claim that only
+/// the device thread ever touches a location. That claim does not hold: a
+/// handle travels across streams (a binding resolved by another stream's
+/// cursor lookup, a buffer shared between streams), so a read can genuinely
+/// race a `reserve`/`bind` on another thread. It was survivable only by
+/// accident — `MemoryLocation` used to be 8 bytes with `page`, `pool` and
+/// `init` packed into a single word, so a racing reader saw the location move
+/// as a unit. Once `page` grew into its own word, a reader could observe the
+/// updated `init` alongside a `page` not yet written — a location reading
+/// "initialized" while still carrying the null page key.
+///
+/// A lock costs an uncontended atomic swap per access, on a path that already
+/// does refcount traffic per binding. In exchange the location is never
+/// observed half-written, whatever its size, and the `unsafe impl Sync` is
+/// gone: `spin::Mutex<MemoryLocation>` is `Sync` on its own merits.
 pub(crate) struct ManagedMemoryDescriptor {
     pub(crate) id: ManagedMemoryId,
-    location: Cell<MemoryLocation>,
+    location: spin::Mutex<MemoryLocation>,
 }
-
-// SAFETY: The channel requires ManagedMemoryHandle to be Send + Sync.
-// Cell is _not_ Sync, but, we know that we only access this from the device thread,
-// so we lie to the compiler and claim it is Sync. Other code must NOT rely on
-// ManagedMemoryDescriptor being Send + Sync.
-unsafe impl Send for ManagedMemoryDescriptor {}
-unsafe impl Sync for ManagedMemoryDescriptor {}
 
 impl core::fmt::Debug for ManagedMemoryDescriptor {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -111,28 +114,25 @@ pub(crate) struct MemoryLocation {
 impl ManagedMemoryDescriptor {
     /// Update the memory location for the given [`ManagedMemoryId`].
     pub(crate) fn update_location(&self, location: MemoryLocation) {
-        self.location.set(location);
+        *self.location.lock() = location;
     }
 
     /// Update only the slice position for the given [`ManagedMemoryId`].
     pub(crate) fn update_slice(&self, slice: u32) {
-        self.location.update(|mut loc| {
-            loc.slice = slice;
-            loc
-        });
+        self.location.lock().slice = slice;
     }
 
     /// Retrieves the current location.
     pub(crate) fn location(&self) -> MemoryLocation {
-        self.location.get()
+        *self.location.lock()
     }
 
     pub(crate) fn slice(&self) -> usize {
-        self.location.get().slice as usize
+        self.location().slice as usize
     }
 
     pub(crate) fn page(&self) -> PageKey {
-        self.location.get().page
+        self.location().page
     }
 }
 
@@ -168,7 +168,7 @@ impl ManagedMemoryHandle {
         Self {
             descriptor: Arc::new(ManagedMemoryDescriptor {
                 id: ManagedMemoryId { value },
-                location: Cell::new(MemoryLocation::uninit()),
+                location: spin::Mutex::new(MemoryLocation::uninit()),
             }),
             handle_count: Arc::new(()),
         }
@@ -306,5 +306,71 @@ mod tests {
 
         handle.descriptor().update_slice(42);
         assert_eq!(handle2.descriptor().slice(), 42);
+    }
+
+    /// A location must never be observed half-written.
+    ///
+    /// Handles cross stream boundaries, so a reader (another stream resolving a
+    /// binding) genuinely races the `reserve`/`bind` that stamps the location.
+    /// While the location lived in a `Cell`, that race was only survivable
+    /// because the struct happened to fit in one word; a reader could otherwise
+    /// see the `init` byte of one write next to the `page` of another — an
+    /// "initialized" location carrying the null page key, which resolves to no
+    /// page at all.
+    #[test_log::test]
+    #[cfg(feature = "std")]
+    fn location_is_never_observed_half_written() {
+        extern crate std;
+        use std::{sync::atomic::AtomicBool, sync::atomic::Ordering, thread, vec::Vec};
+
+        let handle = ManagedMemoryHandle::new();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+
+        // Two real page keys, from a slot map, so `page` differs between the
+        // two locations — that field is the one that grew into its own word.
+        let mut pages = slotmap::SlotMap::<PageKey, ()>::with_key();
+        let key_a = pages.insert(());
+        let key_b = pages.insert(());
+
+        // Two complete, valid locations. Any read must return one of them
+        // verbatim — never a field from one beside a field from the other.
+        let mut a = MemoryLocation::base(1);
+        a.page = key_a;
+        let mut b = MemoryLocation::base(2);
+        b.page = key_b;
+        b.slice = 7;
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let reader = handle.clone();
+                let stop = stop.clone();
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let seen = reader.descriptor().location();
+                        // Every field must belong to the same write. In
+                        // particular a location claiming `init` must carry its
+                        // pool's real page key, never the null one.
+                        let torn = match seen.pool {
+                            0 => seen.init != 0 || seen.page != PageKey::default(),
+                            1 => seen.init != 1 || seen.page != key_a || seen.slice != 0,
+                            2 => seen.init != 1 || seen.page != key_b || seen.slice != 7,
+                            _ => true,
+                        };
+                        assert!(!torn, "observed a half-written location: {seen:?}");
+                    }
+                })
+            })
+            .collect();
+
+        for i in 0..2_000_000 {
+            handle
+                .descriptor()
+                .update_location(if i % 2 == 0 { a } else { b });
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.join().unwrap();
+        }
     }
 }
