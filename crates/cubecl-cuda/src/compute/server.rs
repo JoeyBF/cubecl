@@ -700,11 +700,16 @@ impl CudaServer {
             (None, handle)
         };
 
-        let mut resources = bindings
+        let launch_bindings = bindings
             .tensor_maps
             .iter()
             .map(|it| it.binding.clone())
             .chain(bindings.buffers)
+            .collect::<Vec<_>>();
+
+        let mut resources = launch_bindings
+            .iter()
+            .cloned()
             // A binding that can't be resolved (its allocation is gone, or it was
             // never bound because an earlier `reserve` failed) fails this launch
             // rather than the whole dispatch thread: aborting here poisons the
@@ -879,7 +884,7 @@ impl CudaServer {
                 .map(|s| command.resource(s.binding()).expect("Resource to exist")),
         );
 
-        command.kernel(
+        let launched = command.kernel(
             kernel_id,
             kernel,
             mode,
@@ -888,7 +893,18 @@ impl CudaServer {
             &resources,
             info_const,
             logger,
-        )?;
+        );
+
+        // The kernel reads these allocations asynchronously, so the bindings have
+        // to outlive this call — otherwise the slices read as free the moment the
+        // caller drops its handles, and the next `cleanup` returns pages to the
+        // driver out from under a kernel that is still queued. Retained even when
+        // the launch reports an error: the launch is asynchronous, so a failure
+        // here says nothing about whether the device already touched them.
+        if !launch_bindings.is_empty() {
+            command.retain_until_complete(launch_bindings);
+        }
+        launched?;
 
         Ok(())
     }

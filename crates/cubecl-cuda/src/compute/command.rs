@@ -26,7 +26,7 @@ use cubecl_runtime::{
     id::KernelId,
     logging::ServerLogger,
     memory_management::{ManagedMemoryHandle, MemoryAllocationMode, MemoryHandle},
-    stream::ResolvedStreams,
+    stream::{GcTask, ResolvedStreams},
 };
 use cudarc::driver::sys::{
     CUDA_MEMCPY2D_st, CUmemorytype, CUstream_st, CUtensorMap, cuMemcpy2DAsync_v2,
@@ -333,6 +333,25 @@ impl<'a> Command<'a> {
     pub fn error(&mut self, error: ServerError) {
         let stream = self.streams.current();
         stream.errors.push(error);
+    }
+
+    /// Keeps `retained` alive until the work already queued on the current
+    /// stream has retired on the device.
+    ///
+    /// Resolving a binding yields a bare [`GpuResource`] — a device pointer with
+    /// no claim on the allocation behind it — so once the caller's bindings are
+    /// dropped, nothing stops the pool from reporting those slices free. A
+    /// kernel is dispatched asynchronously, so it may well still be queued (or
+    /// running) at that point; a `cleanup` in between hands the pages back to
+    /// the driver and the kernel then reads freed device memory, which surfaces
+    /// as `CUDA_ERROR_LAUNCH_FAILED` and poisons the context for every stream
+    /// sharing it.
+    ///
+    /// Handing the bindings to the stream GC keeps the allocations reserved
+    /// until a fence says the device is done with them.
+    pub fn retain_until_complete<T: Send + 'static>(&mut self, retained: T) {
+        let fence = Fence::new(self.streams.current().sys);
+        self.streams.gc(GcTask::new(retained, fence));
     }
 
     /// Writes data from the host to GPU memory as specified by the copy descriptor.
