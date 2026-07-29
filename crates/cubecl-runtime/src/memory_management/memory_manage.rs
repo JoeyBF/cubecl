@@ -401,6 +401,17 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
     fn find(&self, binding: ManagedMemoryBinding) -> Result<&Slice, IoError> {
         let id = binding.descriptor();
 
+        // A handle that was never bound — because it is still waiting on
+        // `initialize_memory`, or because the `reserve` behind it failed — must
+        // say so. Without this it falls through to pool 0 and fails there
+        // instead, reporting a missing page for a handle that never named one.
+        if id.location().init == 0 {
+            return Err(IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: "Memory location was never initialized".into(),
+            });
+        }
+
         if id.location().pool >= self.pools.len() as u8 {
             return self.persistent.find(&binding);
         }
@@ -415,7 +426,16 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
 
         let slice = pool.find(&binding)?;
 
-        assert_eq!(slice.handle.descriptor(), binding.descriptor());
+        // A location that resolves to somebody else's slice is a lookup failure,
+        // not a reason to take the process down: the caller can surface it as a
+        // stream error, where an assert aborts the dispatch thread and poisons
+        // the device context for every other stream.
+        if slice.handle.descriptor() != binding.descriptor() {
+            return Err(IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: "Memory location points to a different allocation".into(),
+            });
+        }
 
         Ok(slice)
     }
@@ -907,6 +927,75 @@ mod tests {
         let usage_after = memory_management.memory_usage();
         // Check that we haven't increased our memory usage significantly
         assert!(usage_after.bytes_reserved <= (usage_before.bytes_reserved as f64 * 1.1) as u64);
+    }
+
+    /// A handle whose `reserve` failed — so `initialize_memory` never bound it —
+    /// stays uninitialized. Looking it up must say exactly that, rather than
+    /// falling through to pool 0 and blaming a missing page: the handle never
+    /// named a page, and the real fault is upstream at the failed reservation.
+    #[test_log::test]
+    fn find_never_initialized_binding_names_the_real_problem() {
+        let mut memory_management = MemoryManagement::from_configuration(
+            BytesStorage::default(),
+            &DUMMY_MEM_PROPS,
+            MemoryConfiguration::Custom {
+                pool_options: vec![MemoryPoolOptions {
+                    pool_type: PoolType::ExclusivePages {
+                        max_alloc_size: 1024,
+                    },
+                    dealloc_period: None,
+                }],
+            },
+            Arc::new(ServerLogger::default()),
+            options(),
+        );
+
+        // A live page at slot 0, so a fall-through would have something to hit.
+        let _live = memory_management.reserve(1024).unwrap();
+
+        let unbound = ManagedMemoryHandle::new().binding();
+        let err = memory_management.get_cursor(unbound).unwrap_err();
+        let IoError::NotFound { reason, .. } = &err else {
+            panic!("expected NotFound, got {err:?}");
+        };
+        assert!(
+            alloc::format!("{reason}").contains("never initialized"),
+            "an unbound handle must be reported as such, got: {reason}"
+        );
+    }
+
+    /// A stale location must not take the process down. It used to trip an
+    /// `assert_eq!`, which aborts the dispatch thread and — on CUDA — poisons
+    /// the context for every other stream.
+    #[test_log::test]
+    fn find_stale_descriptor_errors_instead_of_asserting() {
+        let mut memory_management = MemoryManagement::from_configuration(
+            BytesStorage::default(),
+            &DUMMY_MEM_PROPS,
+            MemoryConfiguration::Custom {
+                pool_options: vec![MemoryPoolOptions {
+                    pool_type: PoolType::ExclusivePages {
+                        max_alloc_size: 1024,
+                    },
+                    dealloc_period: None,
+                }],
+            },
+            Arc::new(ServerLogger::default()),
+            options(),
+        );
+
+        let reserved = memory_management.reserve(1024).unwrap();
+        let stale = reserved.clone().binding();
+        let assigned = ManagedMemoryHandle::new();
+        memory_management
+            .bind(reserved, assigned.clone(), 0)
+            .unwrap();
+
+        assert!(matches!(
+            memory_management.get_cursor(stale),
+            Err(IoError::NotFound { .. })
+        ));
+        assert!(memory_management.get_cursor(assigned.binding()).is_ok());
     }
 
     // Test pools without slices. More or less same as tests above.

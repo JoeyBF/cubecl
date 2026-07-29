@@ -121,8 +121,15 @@ impl ComputeServer for CudaServer {
             Err(err) => unreachable!("{err:?}"),
         };
 
-        let reserved = command.reserve(size).unwrap();
-        command.bind(reserved, memory);
+        // The trait gives no way to report failure here, but aborting is worse
+        // than leaving the handle unbound: it poisons the CUDA context, so one
+        // failed reservation takes down every other stream too. Record it on the
+        // stream and leave `memory` uninitialized — a later lookup then fails
+        // with "memory location was never initialized", naming the real problem.
+        match command.reserve(size) {
+            Ok(reserved) => command.bind(reserved, memory),
+            Err(err) => command.error(err.into()),
+        }
     }
 
     fn write(&mut self, descriptors: Vec<(CopyDescriptor, Bytes)>, stream_id: StreamId) {
@@ -698,8 +705,13 @@ impl CudaServer {
             .iter()
             .map(|it| it.binding.clone())
             .chain(bindings.buffers)
-            .map(|binding| command.resource(binding).expect("Resource to exist."))
-            .collect::<Vec<_>>();
+            // A binding that can't be resolved (its allocation is gone, or it was
+            // never bound because an earlier `reserve` failed) fails this launch
+            // rather than the whole dispatch thread: aborting here poisons the
+            // CUDA context, turning one bad handle into a cascade of unrelated
+            // failures on every other stream.
+            .map(|binding| command.resource(binding))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut tensor_maps = Vec::with_capacity(bindings.tensor_maps.len());
 

@@ -117,11 +117,17 @@ impl<'a> Command<'a> {
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(self)))]
     pub fn bind(&mut self, reserved: ManagedMemoryHandle, new: ManagedMemoryHandle) {
         let cursor = self.cursor();
-        self.streams
+        let result = self
+            .streams
             .current()
             .memory_management_gpu
-            .bind(reserved, new, cursor)
-            .unwrap();
+            .bind(reserved, new, cursor);
+
+        // Same reasoning as the other recovery sites: a bind that can't resolve
+        // its reservation fails this operation, not the dispatch thread.
+        if let Err(err) = result {
+            self.error(err.into());
+        }
     }
 
     /// Creates a [Bytes] instance from pinned memory, if suitable for the given size.
