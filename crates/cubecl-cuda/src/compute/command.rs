@@ -26,7 +26,9 @@ use cubecl_runtime::{
     compiler::CubeTask,
     id::KernelId,
     logging::ServerLogger,
-    memory_management::{ManagedMemoryHandle, MemoryAllocationMode, MemoryHandle},
+    memory_management::{
+        ManagedMemoryBinding, ManagedMemoryHandle, MemoryAllocationMode, MemoryHandle,
+    },
     stream::ResolvedStreams,
 };
 use cudarc::driver::sys::{
@@ -141,11 +143,18 @@ impl<'a> Command<'a> {
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(self)))]
     pub fn bind(&mut self, reserved: ManagedMemoryHandle, new: ManagedMemoryHandle) {
         let cursor = self.cursor();
-        self.streams
+        let result = self
+            .streams
             .current()
             .memory_management_gpu
-            .bind(reserved, new, cursor)
-            .unwrap();
+            .bind(reserved, new, cursor);
+
+        // A bind that can't resolve its reservation fails this operation, not
+        // the dispatch thread: aborting poisons the CUDA context for every
+        // stream sharing it.
+        if let Err(err) = result {
+            self.error(err.into());
+        }
     }
 
     /// Creates a [Bytes] instance from pinned memory, if suitable for the given size.
@@ -351,6 +360,12 @@ impl<'a> Command<'a> {
     pub fn error(&mut self, error: ServerError) {
         let stream = self.streams.current();
         stream.errors.push(error);
+    }
+
+    /// Keeps `binding` alive until the device has retired the work queued on
+    /// the current stream. See [`ResolvedStreams::pin`].
+    pub fn pin(&mut self, binding: ManagedMemoryBinding) {
+        self.streams.pin(binding);
     }
 
     /// Writes data from the host to GPU memory as specified by the copy descriptor.

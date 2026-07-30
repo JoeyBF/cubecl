@@ -1,7 +1,7 @@
 use crate::{
     config::streaming::StreamingLogLevel,
     logging::ServerLogger,
-    memory_management::{ManagedMemoryId, SharedMemoryBindings},
+    memory_management::{ManagedMemoryBinding, ManagedMemoryId, SharedMemoryBindings},
     server::{Binding, ServerError},
     stream::{StreamFactory, StreamPool},
 };
@@ -160,6 +160,24 @@ impl<'a, B: EventStreamBackend> ResolvedStreams<'a, B> {
     /// Enqueue a task to be cleaned.
     pub fn gc(&mut self, gc: GcTask<B>) {
         self.gc.sender.send(gc).unwrap();
+    }
+
+    /// Keeps `binding` alive until the device has retired the work queued on
+    /// the current stream, releasing it through the same GC batch as the
+    /// cross-stream pins.
+    ///
+    /// Resolving a binding yields a bare device pointer with no claim on the
+    /// allocation behind it, so a caller that hands one to an asynchronous
+    /// operation has nothing keeping the memory reserved once its own handles
+    /// go away. `is_free` is a host-side refcount and says nothing about what
+    /// the device is still reading, so the pool is free to reuse or deallocate
+    /// the slice while the work is queued.
+    ///
+    /// The cross-stream case is pinned during the sync analysis. This is for
+    /// the rest — a same-stream launch has exactly the same hazard, because
+    /// deallocation is not stream-ordered.
+    pub fn pin(&mut self, binding: ManagedMemoryBinding) {
+        self.analysis.pinned.push(binding);
     }
 }
 

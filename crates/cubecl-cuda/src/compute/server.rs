@@ -121,8 +121,15 @@ impl ComputeServer for CudaServer {
             Err(err) => unreachable!("{err}"),
         };
 
-        let reserved = command.reserve(size).unwrap();
-        command.bind(reserved, memory);
+        // The trait gives no way to report failure here, but aborting is worse
+        // than leaving the handle unbound: it poisons the CUDA context, so one
+        // failed reservation takes down every other stream too. Record it on the
+        // stream and leave `memory` uninitialized — a later lookup then fails
+        // with "memory location was never initialized", naming the real problem.
+        match command.reserve(size) {
+            Ok(reserved) => command.bind(reserved, memory),
+            Err(err) => command.error(err.into()),
+        }
     }
 
     fn write(&mut self, descriptors: Vec<(CopyDescriptor, Bytes)>, stream_id: StreamId) {
@@ -726,15 +733,31 @@ impl CudaServer {
         let mut resources = bindings
             .buffers
             .into_iter()
-            .map(|binding| command.resource(binding).expect("Resource to exist."))
-            .collect::<Vec<_>>();
+            .map(|binding| {
+                // The kernel reads this allocation asynchronously, so the binding
+                // has to outlive the launch: resolving it yields a bare pointer,
+                // and once the caller drops its handles the slice reads free and
+                // the next cleanup can hand the page back to the driver out from
+                // under a kernel that is still queued. The sync analysis pins the
+                // cross-stream bindings; this covers the rest.
+                command.pin(binding.memory.clone());
+                // A binding that can't be resolved (its allocation is gone, or it
+                // was never bound because an earlier `reserve` failed) fails this
+                // launch rather than the whole dispatch thread: aborting here
+                // poisons the CUDA context, turning one bad handle into a cascade
+                // of unrelated failures on every other stream.
+                command.resource(binding)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut tensor_maps = Vec::with_capacity(bindings.tensor_maps.len());
 
         for TensorMapBinding { map, binding } in bindings.tensor_maps.into_iter() {
-            let resource = command
-                .resource(binding)
-                .expect("Tensor map resource exists.");
+            // Same reasoning as the buffer bindings above: pin it across the
+            // asynchronous launch, and fail the launch rather than the dispatch
+            // thread if it can't be resolved.
+            command.pin(binding.memory.clone());
+            let resource = command.resource(binding)?;
             let device_ptr = resource.ptr as *mut c_void;
 
             let mut map_ptr = MaybeUninit::zeroed();
@@ -889,11 +912,14 @@ impl CudaServer {
             tensor_maps.push(binding);
         }
 
-        resources.extend(
-            info_binding
-                .into_iter()
-                .map(|s| command.resource(s.binding()).expect("Resource to exist")),
-        );
+        // The metadata buffer this launch just created: same asynchronous
+        // lifetime as the user's bindings, and `info_binding` is the only thing
+        // keeping it alive once this frame returns.
+        if let Some(handle) = info_binding {
+            let binding = handle.binding();
+            command.pin(binding.memory.clone());
+            resources.push(command.resource(binding)?);
+        }
 
         command.kernel(
             kernel_id,
