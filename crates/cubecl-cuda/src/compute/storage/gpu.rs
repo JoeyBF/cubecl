@@ -5,15 +5,6 @@ use cubecl_runtime::storage::{ComputeStorage, StorageHandle, StorageId, StorageU
 use cudarc::driver::DriverError;
 use std::collections::HashMap;
 
-/// See the diagnostic note in [`GpuStorage::dealloc`].
-static NO_DEALLOC: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    let set = std::env::var("CUBECL_DEBUG_NO_DEALLOC").is_ok();
-    if set {
-        log::warn!("CUBECL_DEBUG_NO_DEALLOC is set: device pages will never be freed");
-    }
-    set
-});
-
 #[derive(Debug, Clone, Copy)]
 enum AllocationKind {
     Async,
@@ -293,7 +284,7 @@ impl ComputeStorage for GpuStorage {
         // why a fully synchronous allocator faults identically.
         //
         // Leaks every page. Fine for a timed soak, never for a real run.
-        if *NO_DEALLOC {
+        if *super::NO_DEALLOC {
             return;
         }
         self.deallocations.push(id);

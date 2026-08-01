@@ -117,6 +117,11 @@ impl ComputeStorage for PinnedMemoryStorage {
 
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(self)))]
     fn dealloc(&mut self, id: StorageId) {
+        // See `super::NO_DEALLOC`: an in-flight DMA references this host buffer
+        // just as much as its device counterpart.
+        if *super::NO_DEALLOC {
+            return;
+        }
         if let Some(resource) = self.memory.remove(&id) {
             // SAFETY: `resource.ptr` was allocated by `cuMemAllocHost_v2` and has not been
             // freed yet. After this call, the pointer is invalid and removed from `self.memory`.

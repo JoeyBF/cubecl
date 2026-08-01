@@ -456,6 +456,13 @@ impl<'a> Command<'a> {
             });
         }
 
+        // The host-to-device copy below is asynchronous, so the destination has
+        // to outlive this call. The host side is already covered (the source
+        // buffer goes to the drop queue, released behind a fence); the device
+        // side was not, so once the caller dropped its handle the slice read
+        // free and the pool could hand its page to another allocation while the
+        // copy was still queued.
+        self.pin(handle.memory.clone());
         let resource = self.resource(handle)?;
 
         let size = data.len();
