@@ -174,10 +174,32 @@ struct PtrBindings {
 impl PtrBindings {
     /// Creates a new [`PtrBindings`] instance with a fixed-size ring buffer.
     fn new() -> Self {
+        // Diagnostic: the ring is sized at `CUDA_MAX_BINDINGS`, which is also the
+        // advertised *per-kernel* binding limit. Those are different quantities.
+        // If a slot has to stay intact until the kernel reading it retires — which
+        // is what this type's doc claims — then the ring spans every launch still
+        // in flight on this stream, not one launch. A kernel binding N buffers
+        // wraps it every `1024 / N` launches, and the slot a live kernel is using
+        // is then overwritten with an unrelated pointer.
+        //
+        // Enlarging the ring makes wrap-around unreachable without changing
+        // anything else. If faults disappear, the sizing is the fault; if they do
+        // not, `cuLaunchKernel` marshals its arguments at enqueue and this whole
+        // mechanism is a dead end.
+        let capacity = std::env::var("CUBECL_DEBUG_PTR_RING")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(crate::device::CUDA_MAX_BINDINGS as usize)
+            .max(crate::device::CUDA_MAX_BINDINGS as usize);
+
+        if capacity != crate::device::CUDA_MAX_BINDINGS as usize {
+            log::warn!("CUBECL_DEBUG_PTR_RING is set: binding ring sized at {capacity}");
+        }
+
         Self {
             // SAFETY: `CUdeviceptr` is a `u64`, valid for any bit pattern. All slots are
             // written via `register()` before being read, so uninitialized values are never observed.
-            slots: unsafe { uninit_vec(crate::device::CUDA_MAX_BINDINGS as usize) },
+            slots: unsafe { uninit_vec(capacity) },
             cursor: 0,
         }
     }
