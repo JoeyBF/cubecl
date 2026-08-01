@@ -43,6 +43,12 @@ use std::{ffi::c_void, ops::DerefMut, sync::Arc};
 pub struct Command<'a> {
     ctx: &'a mut CudaContext,
     pub(crate) streams: ResolvedStreams<'a, CudaStreamBackend>,
+    /// Origin streams this command has already ordered against, so a launch
+    /// binding dozens of buffers from the same producer enqueues one wait rather
+    /// than one per buffer. Expected to hold a handful of entries, so a `Vec`
+    /// beats a hash set.
+    #[new(default)]
+    alloc_ordered: Vec<StreamId>,
 }
 
 impl<'a> Command<'a> {
@@ -57,10 +63,64 @@ impl<'a> Command<'a> {
     /// * `Ok(GpuResource)` - The GPU resource associated with the binding.
     /// * `Err(IoError::InvalidHandle)` - If the binding does not correspond to a valid resource.
     pub fn resource(&mut self, binding: Binding) -> Result<GpuResource, IoError> {
+        self.order_against_allocation(binding.stream);
+
         self.streams
             .get(&binding.stream)
             .memory_management_gpu
             .get_resource(binding.memory, binding.offset_start, binding.offset_end)
+    }
+
+    /// Orders the current stream after `origin`'s allocations before this
+    /// command dereferences memory that `origin` allocated.
+    ///
+    /// Device memory comes from `cuMemAllocAsync`, which is stream-ordered: the
+    /// pages behind a returned address are only guaranteed mapped for work
+    /// ordered after the allocation on the allocating stream. The pool recycles,
+    /// so a page a consumer touches without that ordering may have no valid
+    /// mapping — an illegal address rather than stale data. The cross-stream
+    /// sync analysis orders buffer *contents*, which does not help: the hazard
+    /// is the mapping.
+    ///
+    /// This is the right place for it because `resource` is the one point where
+    /// a device pointer is minted, so every consumer — launches, copies, the
+    /// peer paths — is covered by construction.
+    ///
+    /// Ordering once per origin stream per command is enough: the event covers
+    /// every allocation that stream has made, so a later binding from the same
+    /// origin is already ordered.
+    fn order_against_allocation(&mut self, origin: StreamId) {
+        if origin == self.streams.current || self.alloc_ordered.contains(&origin) {
+            return;
+        }
+        self.alloc_ordered.push(origin);
+
+        let Some(event) = self
+            .streams
+            .get(&origin)
+            .memory_management_gpu
+            .storage()
+            .allocation_event()
+        else {
+            // Nothing stream-ordered was allocated there; `cuMemAlloc` memory is
+            // context-wide valid on return and needs no ordering.
+            return;
+        };
+
+        let consumer = self.streams.current().sys;
+
+        // SAFETY: `consumer` is a valid CUDA stream and `event` is a live event
+        // owned by the origin stream's storage. The wait does not consume the
+        // event, so the origin can keep re-recording it.
+        if let Err(err) = unsafe {
+            cudarc::driver::result::stream::wait_event(
+                consumer,
+                event,
+                cudarc::driver::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+        } {
+            log::error!("Couldn't order against the allocating stream: {err}");
+        }
     }
 
     /// Get the stream cursor.

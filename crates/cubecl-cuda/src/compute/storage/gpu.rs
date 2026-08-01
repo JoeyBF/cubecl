@@ -21,6 +21,28 @@ pub struct GpuStorage {
     ptr_bindings: PtrBindings,
     stream: cudarc::driver::sys::CUstream,
     mem_alignment: usize,
+    /// An event on [`stream`](Self::stream), re-recorded after every
+    /// stream-ordered allocation.
+    ///
+    /// `cuMemAllocAsync` serves from a mempool and is *stream-ordered*: the
+    /// address comes back to the host immediately, but the pages behind it are
+    /// only guaranteed mapped to work ordered after the allocation on the
+    /// allocating stream. Recycling makes that concrete — a page freed by an
+    /// earlier `cuMemFreeAsync` can be handed straight back out, so a stream
+    /// that dereferences it without ordering against the allocation may find no
+    /// valid mapping at all. That faults as an illegal address rather than
+    /// reading stale bytes.
+    ///
+    /// Ordering the buffer's *contents* across streams is not enough, because
+    /// the hazard is the mapping, not the data. Consumers on another stream
+    /// wait on this event before first use; see
+    /// [`allocation_event`](Self::allocation_event).
+    ///
+    /// `None` until the first stream-ordered allocation. Allocations that fell
+    /// back to `cuMemAlloc` need no ordering — that memory is context-wide
+    /// valid on return — so a storage that only ever took the fallback never
+    /// creates an event.
+    alloc_event: Option<cudarc::driver::sys::CUevent>,
 }
 
 /// A GPU memory resource allocated for CUDA using [`GpuStorage`].
@@ -54,6 +76,52 @@ impl GpuStorage {
             ptr_bindings: PtrBindings::new(),
             stream,
             mem_alignment,
+            alloc_event: None,
+        }
+    }
+
+    /// The event another stream must wait on before it first dereferences
+    /// memory this storage allocated. `None` when nothing stream-ordered has
+    /// been allocated yet.
+    ///
+    /// Waiting on the latest recorded state is deliberately conservative: it
+    /// orders the consumer after *every* allocation made so far, which includes
+    /// whichever one it actually cares about. Re-recording later does not
+    /// disturb a wait that was already enqueued.
+    pub fn allocation_event(&self) -> Option<cudarc::driver::sys::CUevent> {
+        self.alloc_event
+    }
+
+    /// Records the allocation event on this storage's stream, creating it on
+    /// first use.
+    fn record_allocation(&mut self) {
+        let event = match self.alloc_event {
+            Some(event) => event,
+            None => {
+                // Timing is disabled: this event exists purely to order streams,
+                // and the timing machinery costs more to record.
+                let event = match cudarc::driver::result::event::create(
+                    cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
+                ) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        // Without the event a cross-stream consumer cannot order
+                        // against this allocation. Surfacing that as an
+                        // allocation failure would be worse than the status quo,
+                        // so log and carry on with the pre-existing behaviour.
+                        log::error!("Couldn't create the CUDA allocation-ordering event: {err}");
+                        return;
+                    }
+                };
+                self.alloc_event = Some(event);
+                event
+            }
+        };
+
+        // SAFETY: `event` was created above (or on an earlier call) and
+        // `self.stream` is a valid, initialized CUDA stream.
+        if let Err(err) = unsafe { cudarc::driver::result::event::record(event, self.stream) } {
+            log::error!("Couldn't record the CUDA allocation-ordering event: {err}");
         }
     }
 
@@ -173,7 +241,13 @@ impl ComputeStorage for GpuStorage {
         // The returned pointer is stored in `self.memory` and freed on deallocation.
         let ptr = unsafe { cudarc::driver::result::malloc_async(self.stream, size as usize) };
         let (ptr, kind) = match ptr {
-            Ok(ptr) => (ptr, AllocationKind::Async),
+            Ok(ptr) => {
+                // Stream-ordered: the pages are only guaranteed mapped for work
+                // ordered after this point on `self.stream`. Publish that point
+                // so a consumer on another stream can wait for it.
+                self.record_allocation();
+                (ptr, AllocationKind::Async)
+            }
             Err(_) => unsafe {
                 match cudarc::driver::result::malloc_sync(size as usize) {
                     Ok(ptr) => (ptr, AllocationKind::Sync),
