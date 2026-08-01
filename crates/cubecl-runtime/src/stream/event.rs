@@ -126,10 +126,29 @@ impl<B: EventStreamBackend> GcThread<B> {
     fn new() -> GcThread<B> {
         let (sender, recv) = std::sync::mpsc::sync_channel::<GcTask<B>>(8);
 
+        // Diagnostic: never release a pin, so a pinned allocation can never be
+        // reused or deallocated for the rest of the process. Answers one
+        // question — is the fault a reclamation that outran its pin? If faults
+        // vanish with this set, the pin *lifetime* is wrong (released too early,
+        // or the payload doesn't actually pin). If they persist, whatever is
+        // being reclaimed was never pinned in the first place, and the bug is in
+        // what gets pinned rather than for how long.
+        //
+        // Leaks every pinned binding. Fine for a timed soak, never for a run
+        // that has to finish.
+        let retain_pins = std::env::var("CUBECL_DEBUG_RETAIN_PINS").is_ok();
+        if retain_pins {
+            log::warn!("CUBECL_DEBUG_RETAIN_PINS is set: pinned memory will never be released");
+        }
+
         std::thread::spawn(move || {
             while let Ok(event) = recv.recv() {
                 B::wait_event_sync(event.event).unwrap();
-                core::mem::drop(event.to_drop);
+                if retain_pins {
+                    core::mem::forget(event.to_drop);
+                } else {
+                    core::mem::drop(event.to_drop);
+                }
             }
         });
 
