@@ -16,7 +16,7 @@ enum AllocationKind {
 /// This struct manages memory resources for CUDA kernels, allowing them to be used as bindings
 /// for launching kernels.
 pub struct GpuStorage {
-    memory: HashMap<StorageId, (cudarc::driver::sys::CUdeviceptr, AllocationKind)>,
+    memory: HashMap<StorageId, (cudarc::driver::sys::CUdeviceptr, AllocationKind, u64)>,
     deallocations: Vec<StorageId>,
     ptr_bindings: PtrBindings,
     stream: cudarc::driver::sys::CUstream,
@@ -134,7 +134,7 @@ impl GpuStorage {
             .filter_map(|id| self.memory.remove(&id))
             // SAFETY: Each `ptr` was obtained from a prior `malloc_async` or `malloc_sync`
             // call and has not been freed yet. The deallocation method matches the allocation kind.
-            .for_each(|(ptr, kind)| unsafe {
+            .for_each(|(ptr, kind, _)| unsafe {
                 match kind {
                     AllocationKind::Async => {
                         let _ = cudarc::driver::result::free_async(ptr, self.stream);
@@ -236,13 +236,33 @@ impl ComputeStorage for GpuStorage {
     }
 
     fn get(&mut self, handle: &StorageHandle) -> Self::Resource {
-        let (ptr, _) = self
+        let (ptr, _, allocated) = self
             .memory
             .get(&handle.id)
             .expect("Storage handle not found");
 
         let offset = handle.offset();
         let size = handle.size();
+
+        // This is the moment a device pointer is minted, and the last point at
+        // which the request can still be compared against what was actually
+        // allocated. Past here the pointer and length are opaque to the host:
+        // an over-long range only shows up as an asynchronous fault on an
+        // address nothing freed, with no provenance attached.
+        //
+        // Reported rather than enforced — refusing the request would turn a
+        // suspicion into an outage, and the range may well be fine. The log
+        // carries everything needed to place the blame precisely.
+        if offset.saturating_add(size) > *allocated {
+            log::error!(
+                "Resource {:?} resolves to [{offset}, {}) but only {allocated} bytes were \
+                 allocated. A kernel handed this range reads past the allocation, which \
+                 faults on whatever is (or isn't) mapped after it.",
+                handle.id,
+                offset.saturating_add(size),
+            );
+        }
+
         let ptr = self.ptr_bindings.register(ptr + offset);
 
         GpuResource::new(
@@ -289,7 +309,7 @@ impl ComputeStorage for GpuStorage {
             },
         };
 
-        self.memory.insert(id, (ptr, kind));
+        self.memory.insert(id, (ptr, kind, size));
         Ok(StorageHandle::new(
             id,
             StorageUtilization { offset: 0, size },

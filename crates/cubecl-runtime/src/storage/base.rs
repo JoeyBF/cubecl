@@ -28,6 +28,31 @@ pub struct StorageHandle {
     pub utilization: StorageUtilization,
 }
 
+/// Shrinks a size by `offset_bytes`, refusing to wrap.
+///
+/// These offsets come from the caller's view of a buffer, which can disagree
+/// with the slice's current utilization. On `u64` an unchecked subtraction
+/// turns that disagreement into a length near `2^64` — the kernel then walks
+/// off the end of a perfectly live allocation and faults on unmapped memory,
+/// with nothing freed and no data corrupted, which is close to undebuggable
+/// from the fault alone.
+///
+/// Clamping to zero keeps the access in bounds, and the log names the operands
+/// so the real inconsistency can be found upstream.
+fn checked_shrink(size: u64, offset_bytes: u64, op: &str) -> u64 {
+    match size.checked_sub(offset_bytes) {
+        Some(size) => size,
+        None => {
+            log::error!(
+                "StorageHandle::{op}: offset {offset_bytes} exceeds size {size}; clamping to an \
+                 empty range. A binding's offsets disagree with its allocation — this would \
+                 otherwise become a ~2^64 length."
+            );
+            0
+        }
+    }
+}
+
 impl StorageHandle {
     /// Returns the size the handle is pointing to in memory.
     ///
@@ -47,7 +72,7 @@ impl StorageHandle {
     pub fn offset_start(&self, offset_bytes: u64) -> Self {
         let utilization = StorageUtilization {
             offset: self.offset() + offset_bytes,
-            size: self.size() - offset_bytes,
+            size: checked_shrink(self.size(), offset_bytes, "offset_start"),
         };
 
         Self {
@@ -60,7 +85,7 @@ impl StorageHandle {
     pub fn offset_end(&self, offset_bytes: u64) -> Self {
         let utilization = StorageUtilization {
             offset: self.offset(),
-            size: self.size() - offset_bytes,
+            size: checked_shrink(self.size(), offset_bytes, "offset_end"),
         };
 
         Self {
