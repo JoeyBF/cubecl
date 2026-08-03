@@ -386,6 +386,9 @@ impl Launch {
             if let Some(cluster_dim) = &self.args.cluster_dim {
                 settings.extend(quote![.cluster_dim(#cluster_dim)]);
             }
+            if let Some(min_blocks_per_sm) = &self.args.min_blocks_per_sm {
+                settings.extend(quote![.min_blocks_per_sm(#min_blocks_per_sm)]);
+            }
 
             quote! {
                 #[doc = #kernel_doc]
@@ -472,6 +475,9 @@ impl Launch {
         }
         if let Some(cluster_dim) = &self.args.cluster_dim {
             settings.extend(quote![.cluster_dim(#cluster_dim)]);
+        }
+        if let Some(min_blocks_per_sm) = &self.args.min_blocks_per_sm {
+            settings.extend(quote![.min_blocks_per_sm(#min_blocks_per_sm)]);
         }
 
         let generics = &self.kernel_generics;

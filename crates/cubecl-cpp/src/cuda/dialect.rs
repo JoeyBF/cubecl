@@ -364,13 +364,22 @@ impl<M: DialectWmmaCompiler<Self>> DialectBindings<Self> for CudaDialect<M> {
         buffers: &[KernelArg<Self>],
         flags: &Flags<Self>,
     ) -> std::fmt::Result {
+        // `__launch_bounds__(maxThreadsPerBlock[, minBlocksPerSM])`. The second argument is only
+        // emitted when the kernel asked for it (see `KernelOptions::min_blocks_per_sm`); omitting
+        // it leaves ptxas free to allocate registers with no occupancy target, which is the right
+        // default but leaves register-hungry kernels pinned at whatever block count their natural
+        // allocation happens to allow.
         write!(
             f,
             "
 
-extern \"C\" __global__ void __launch_bounds__({})",
+extern \"C\" __global__ void __launch_bounds__({}",
             flags.cube_dim.num_elems()
         )?;
+        if let Some(min_blocks_per_sm) = flags.min_blocks_per_sm {
+            write!(f, ", {min_blocks_per_sm}")?;
+        }
+        f.write_str(")")?;
         if let Some(cluster_dim) = flags.cluster_dim {
             write!(
                 f,

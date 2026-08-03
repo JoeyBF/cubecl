@@ -73,6 +73,15 @@ impl KernelSettings {
         self.options.cluster_dim = Some(cluster_dim);
         self
     }
+
+    /// Ask the backend to fit at least this many thread blocks per SM.
+    ///
+    /// See [`KernelOptions::min_blocks_per_sm`]. Only the CUDA backend honours it today, where it
+    /// becomes the second argument of `__launch_bounds__`.
+    pub fn min_blocks_per_sm(mut self, min_blocks_per_sm: u32) -> Self {
+        self.options.min_blocks_per_sm = Some(min_blocks_per_sm);
+        self
+    }
 }
 
 /// Information related to a buffer binding.

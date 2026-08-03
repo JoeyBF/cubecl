@@ -61,6 +61,17 @@ pub struct KernelOptions {
     pub debug_symbols: bool,
     /// CUDA Cluster dim, if any
     pub cluster_dim: Option<CubeDim>,
+    /// Minimum thread blocks the compiler should fit per SM, if the kernel wants to constrain
+    /// occupancy.
+    ///
+    /// Emitted as the second argument of CUDA's `__launch_bounds__`. Without it `ptxas` allocates
+    /// registers subject only to the occupancy it can already reach, so a register-hungry kernel
+    /// settles at whatever block count its natural allocation permits and spends any spare
+    /// registers keeping values live rather than raising occupancy. Setting this asks for a
+    /// specific occupancy target, at the cost of spills if the kernel cannot fit.
+    ///
+    /// `None` (the default) preserves the previous behaviour: no second argument is emitted.
+    pub min_blocks_per_sm: Option<u32>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]

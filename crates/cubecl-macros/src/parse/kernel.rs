@@ -31,6 +31,8 @@ pub(crate) struct KernelArgs {
     /// Generate expansion only, for expanding existing types
     pub expand_only: Flag,
     pub cluster_dim: Option<Expr>,
+    /// Minimum thread blocks per SM the backend should fit (CUDA `__launch_bounds__` second arg).
+    pub min_blocks_per_sm: Option<Expr>,
     pub src_file: Option<LitStr>,
     /// Base traits for a split expand trait
     pub expand_base_traits: Option<String>,

@@ -94,6 +94,7 @@ pub struct Flags<D: Dialect> {
     pub has_info: bool,
     pub cube_dim: CubeDim,
     pub cluster_dim: Option<CubeDim>,
+    pub min_blocks_per_sm: Option<u32>,
     pub address_type: Item<D>,
 }
 
@@ -138,6 +139,7 @@ impl<D: Dialect> Default for Flags<D> {
             has_dynamic_meta: Default::default(),
             cube_dim: CubeDim::new_single(),
             cluster_dim: Default::default(),
+            min_blocks_per_sm: Default::default(),
             address_type: Item::Scalar(Elem::U32),
         }
     }
@@ -296,6 +298,7 @@ impl<D: Dialect> CppCompiler<D> {
             static_meta_length: self.info.metadata.static_len() as usize,
             cube_dim: value.cube_dim,
             cluster_dim: value.options.cluster_dim,
+            min_blocks_per_sm: value.options.min_blocks_per_sm,
             address_type,
         };
 

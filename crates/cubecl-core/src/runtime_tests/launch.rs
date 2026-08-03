@@ -45,6 +45,16 @@ pub fn kernel_dynamic_addressing(output: &mut [f32]) {
     }
 }
 
+// The occupancy target is only meaningful on CUDA, where it becomes the second argument of
+// `__launch_bounds__`. Everywhere else the option is ignored, so this just re-checks a plain
+// launch. Four blocks is trivially reachable for a kernel this small, so no backend should spill.
+#[cube(launch, min_blocks_per_sm = 4)]
+pub fn kernel_with_min_blocks_per_sm(output: &mut [f32]) {
+    if UNIT_POS == 0 {
+        output[0] = 5.0;
+    }
+}
+
 #[cube(launch)]
 pub fn kernel_inplace(input: &[f32], output: &mut [f32]) {
     if UNIT_POS == 0 {
@@ -346,6 +356,22 @@ pub fn test_max_units_error<R: Runtime>(client: ComputeClient<R>) {
     }
 }
 
+pub fn test_kernel_with_min_blocks_per_sm<R: Runtime>(client: ComputeClient<R>) {
+    let handle = client.create_from_slice(f32::as_bytes(&[0.0, 1.0]));
+
+    kernel_with_min_blocks_per_sm::launch(
+        &client,
+        CubeCount::Static(1, 1, 1),
+        CubeDim::new_1d(1),
+        unsafe { BufferArg::from_raw_parts(handle.clone(), 2) },
+    );
+
+    let actual = client.read_one_unchecked(handle);
+    let actual = f32::from_bytes(&actual);
+
+    assert_eq!(actual[0], 5.0);
+}
+
 pub fn test_kernel_dynamic_addressing<R: Runtime>(
     client: ComputeClient<R>,
     address_type: AddressType,
@@ -401,6 +427,14 @@ macro_rules! testgen_launch {
         fn test_launch_with_comptime_tag() {
             let client = TestRuntime::client(&Default::default());
             cubecl_core::runtime_tests::launch::test_kernel_with_comptime_tag::<TestRuntime>(
+                client,
+            );
+        }
+
+        #[$crate::runtime_tests::test_log::test]
+        fn test_launch_with_min_blocks_per_sm() {
+            let client = TestRuntime::client(&Default::default());
+            cubecl_core::runtime_tests::launch::test_kernel_with_min_blocks_per_sm::<TestRuntime>(
                 client,
             );
         }
